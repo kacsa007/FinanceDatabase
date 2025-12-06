@@ -11,9 +11,9 @@ import financedatabase as fd
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
-import requests
 
 
 st.set_page_config(
@@ -260,23 +260,106 @@ def _business_days(start_date: datetime.date, periods: int) -> List[datetime.dat
 
 
 def fetch_news(symbol: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """Fetch recent headlines via yfinance (public endpoint)."""
+    """Fetch recent headlines via yfinance; fallback to Yahoo RSS if empty."""
+    cleaned: List[Dict[str, Any]] = []
+
+    # Primary: yfinance news endpoint.
     try:
         ticker = yf.Ticker(symbol)
         news = ticker.news or []
+        for item in news[: limit * 2]:  # over-fetch then filter
+            title = (item.get("title") or "").strip()
+            link = (item.get("link") or "").strip()
+            if not title or not link:
+                continue
+            cleaned.append(
+                {
+                    "title": title,
+                    "link": link,
+                    "publisher": item.get("publisher"),
+                    "providerPublishTime": item.get("providerPublishTime"),
+                    "source": "yfinance",
+                }
+            )
+    except Exception:
+        pass
+
+    if cleaned:
+        return cleaned[:limit]
+
+    # Fallback: Yahoo RSS feed (headline-only, public).
+    rss_url = (
+        f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
+    )
+    try:
+        resp = requests.get(rss_url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(resp.content)
+        items = root.findall(".//item")[:limit]
+        for item in items:
+            cleaned.append(
+                {
+                    "title": (item.findtext("title") or "Untitled").strip(),
+                    "link": (item.findtext("link") or "").strip(),
+                    "publisher": "Yahoo Finance RSS",
+                    "providerPublishTime": item.findtext("pubDate"),
+                    "source": "rss",
+                }
+            )
     except Exception:
         return []
-    cleaned = []
-    for item in news[:limit]:
-        cleaned.append(
-            {
-                "title": item.get("title", "Untitled"),
-                "link": item.get("link"),
-                "publisher": item.get("publisher"),
-                "providerPublishTime": item.get("providerPublishTime"),
-            }
-        )
+
     return cleaned
+
+
+def fetch_options_near_term(symbol: str, last_price: float) -> Dict[str, Any] | None:
+    """Fetch nearest expiry option chain and pick strikes near spot."""
+    try:
+        ticker = yf.Ticker(symbol)
+        expiries = ticker.options
+    except Exception:
+        return None
+    if not expiries:
+        return None
+    expiry = expiries[0]
+    try:
+        chain = ticker.option_chain(expiry)
+    except Exception:
+        return None
+
+    def _pick(row_df: pd.DataFrame) -> pd.Series | None:
+        if row_df is None or row_df.empty:
+            return None
+        row_df = row_df.dropna(subset=["strike"])
+        if row_df.empty:
+            return None
+        nearest_idx = (row_df["strike"] - last_price).abs().idxmin()
+        return row_df.loc[nearest_idx]
+
+    call = _pick(chain.calls if hasattr(chain, "calls") else None)
+    put = _pick(chain.puts if hasattr(chain, "puts") else None)
+    if call is None and put is None:
+        return None
+
+    def _premium(row: pd.Series) -> float:
+        if row is None:
+            return float("nan")
+        bid = row.get("bid", float("nan"))
+        ask = row.get("ask", float("nan"))
+        last = row.get("lastPrice", float("nan"))
+        if pd.notna(bid) and pd.notna(ask) and (bid + ask) > 0:
+            return float((bid + ask) / 2)
+        if pd.notna(last):
+            return float(last)
+        return float("nan")
+
+    return {
+        "expiry": expiry,
+        "call": {"strike": float(call["strike"]), "premium": _premium(call)} if call is not None else None,
+        "put": {"strike": float(put["strike"]), "premium": _premium(put)} if put is not None else None,
+    }
 
 
 def fetch_calendar_flags(symbol: str) -> Dict[str, Any]:
@@ -537,6 +620,10 @@ def render_simulation(
                 f"range p5–p95: {next_row['p5']:.2f} – {next_row['p95']:.2f}, "
                 f"prob > last close ({last_price:.2f}): {next_row['prob_above_last']*100:.1f}%."
             )
+            st.caption(
+                "Snapshots use business days only (skip weekends/holidays). p5/p50/p95 are simulated closing prices for that date; "
+                "Prob>last is the share of simulated paths finishing above the current close."
+            )
 
         with st.expander("Diagnostics and forecast"):
             st.markdown(
@@ -611,6 +698,114 @@ def render_simulation(
         if log_json:
             append_json_log(log_entry)
             st.info("Simulation logged to simulation_logs.jsonl")
+
+        # Option what-if: nearest expiry, ATM-ish strikes, simple P/L and probabilities.
+        option_data = fetch_options_near_term(symbol, last_price)
+        if option_data:
+            expiry = option_data["expiry"]
+            st.markdown(f"**Options (nearest expiry: {expiry}) — simple what-if using simulation horizon distribution:**")
+            option_notes = (
+                "We use the simulated price distribution to estimate probabilities/P&L at expiry. "
+                "Premiums are mid(bid,ask) or last if missing. One contract controls 100 shares. "
+                "This is illustrative only; live markets, spreads, and greeks are not modeled."
+            )
+            st.caption(option_notes)
+
+            def option_metrics(row: Dict[str, float], kind: str) -> Dict[str, float] | None:
+                if row is None or pd.isna(row.get("premium", np.nan)) or pd.isna(row.get("strike", np.nan)):
+                    return None
+                strike = row["strike"]
+                premium = row["premium"]
+                greeks = {
+                    "iv": float(row.get("impliedVolatility", np.nan)) if row is not None else np.nan,
+                    "delta": float(row.get("delta", np.nan)) if row is not None else np.nan,
+                    "gamma": float(row.get("gamma", np.nan)) if row is not None else np.nan,
+                    "theta": float(row.get("theta", np.nan)) if row is not None else np.nan,
+                    "vega": float(row.get("vega", np.nan)) if row is not None else np.nan,
+                }
+                if kind == "call":
+                    payoff = np.maximum(terminal_prices - strike, 0)
+                else:
+                    payoff = np.maximum(strike - terminal_prices, 0)
+                prob_itm = float((payoff > 0).mean())
+                exp_payoff = float(payoff.mean()) * 100
+                cost = premium * 100
+                exp_pl_1 = exp_payoff - cost
+                payoff_p5 = float(np.percentile(payoff, 5) * 100)
+                payoff_p95 = float(np.percentile(payoff, 95) * 100)
+                scenarios = {}
+                for capital in (500, 1000):
+                    contracts = max(int(capital // cost), 0)
+                    scenarios[f"capital_{capital}"] = {
+                        "contracts": contracts,
+                        "total_cost": contracts * cost,
+                        "exp_payoff": contracts * exp_payoff,
+                        "exp_pl": contracts * exp_pl_1,
+                        "p5_payoff": contracts * payoff_p5,
+                        "p95_payoff": contracts * payoff_p95,
+                    }
+                return {
+                    "strike": strike,
+                    "premium": premium,
+                    "prob_itm": prob_itm,
+                    "exp_payoff_1c": exp_payoff,
+                    "exp_pl_1c": exp_pl_1,
+                    "p5_payoff_1c": payoff_p5,
+                    "p95_payoff_1c": payoff_p95,
+                    "scenarios": scenarios,
+                    "greeks": greeks,
+                }
+
+            call_metrics = option_metrics(option_data.get("call"), "call")
+            put_metrics = option_metrics(option_data.get("put"), "put")
+
+            def render_opt(label: str, metrics: Dict[str, Any]) -> None:
+                if not metrics:
+                    st.write(f"{label}: no near-the-money contract data.")
+                    return
+                st.markdown(
+                    f"- **{label}** @ strike {metrics['strike']:.2f}, premium ~ {metrics['premium']:.2f} "
+                    f"(cost {metrics['premium']*100:.0f} per contract). "
+                    f"Prob ITM: {metrics['prob_itm']*100:.1f}% | "
+                    f"Exp payoff: {metrics['exp_payoff_1c']:.2f} | "
+                    f"Exp P/L: {metrics['exp_pl_1c']:.2f} (per contract). "
+                    f"P5–P95 payoff: {metrics['p5_payoff_1c']:.2f} – {metrics['p95_payoff_1c']:.2f} (per contract)."
+                )
+                st.write(
+                    {
+                        "capital_500": metrics["scenarios"]["capital_500"],
+                        "capital_1000": metrics["scenarios"]["capital_1000"],
+                        "greeks": metrics["greeks"],
+                    }
+                )
+                # Payoff histogram for the contract.
+                st.plotly_chart(
+                    go.Figure(
+                        data=[
+                            go.Histogram(
+                                x=(np.maximum(terminal_prices - metrics["strike"], 0) if label.lower().startswith("call")
+                                   else np.maximum(metrics["strike"] - terminal_prices, 0))
+                                * 100
+                                - metrics["premium"] * 100,
+                                nbinsx=40,
+                                marker=dict(color="rgba(233, 30, 99, 0.5)"),
+                                name=f"{label} payoff ($/contract)",
+                            )
+                        ],
+                        layout=dict(
+                            title=f"{label} payoff distribution (per contract)",
+                            margin=dict(l=20, r=20, t=30, b=30),
+                            xaxis_title="P/L per contract ($)",
+                            yaxis_title="Count",
+                        ),
+                    ),
+                    use_container_width=True,
+                )
+
+            render_opt("Call", call_metrics)
+            render_opt("Put", put_metrics)
+        else:
+            st.info("No option chain data available from yfinance for this ticker (or fetch failed).")
 
 
 def _normalize_filters(filters: Dict[str, List[str]]) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
@@ -709,6 +904,25 @@ def main() -> None:
         log_runs = st.checkbox("Log simulations to CSV (simulation_logs.csv)", value=False)
         log_json = st.checkbox("Log simulations to JSONL (simulation_logs.jsonl)", value=False)
         use_bootstrap = st.checkbox("Use historical bootstrap (resample past returns)", value=False)
+
+        # Historical CSV export for a selected symbol.
+        history_symbol = st.selectbox(
+            "Download historical prices (uses current lookback and yfinance)",
+            options=selectable_symbols,
+            index=0,
+        )
+        if st.button("Export history as CSV"):
+            try:
+                hist_series = fetch_history(history_symbol, lookback)
+                csv_bytes = hist_series.to_csv(header=["price"]).encode("utf-8")
+                st.download_button(
+                    label=f"Download {history_symbol} history CSV",
+                    data=csv_bytes,
+                    file_name=f"{history_symbol}_history.csv",
+                    mime="text/csv",
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                st.error(f"Could not fetch history for {history_symbol}: {exc}")
 
         if symbols:
             render_simulation(symbols, lookback, horizon, paths, log_runs, log_json, use_bootstrap)
